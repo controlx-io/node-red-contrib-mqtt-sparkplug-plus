@@ -880,7 +880,7 @@ module.exports = function(RED) {
                                 node.sendBirth();
                             }else
                             {
-                                node.warn(`NCMD command ${m.name} is not supported`);
+                                //node.warn(`NCMD command ${m.name} is not supported`);
                             }
                         }else {
                             node.warn(`invalid NCMD received`);
