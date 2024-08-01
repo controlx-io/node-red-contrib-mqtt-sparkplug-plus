@@ -16,6 +16,8 @@
 
 const { encodePayload } = require("sparkplug-payload/lib/sparkplugbpayload");
 
+const SUPPORT_SPB_2 = false;
+
 module.exports = function(RED) {
     "use strict";
     var mqtt = require("mqtt");
@@ -780,19 +782,21 @@ module.exports = function(RED) {
                         if (node.enableStoreForward === true) {
                             let options = { qos: 0 };
 
-                            // SPb 2.0 Support
-                            let primaryScadaTopic = `STATE/${node.primaryScada}`;
-                            node.subscribe(primaryScadaTopic,options,function(topic_,payload_,packet) {
-                                let status = payload_.toString();
-                                node.primaryScadaStatus = status;
-                                for (var id in node.users) {
-                                    if (node.users.hasOwnProperty(id)) {
-                                        let state = node.enableStoreForward && node.primaryScadaStatus === "OFFLINE"  && node.users[id].shouldBuffer === true ? "BUFFERING" : "CONNECTED";
-                                        node.setConnectionState(node.users[id], state);
-                                    }
-                                }
-                                node.emptyQueue();
-                            });
+                            if (SUPPORT_SPB_2) {
+                              // SPb 2.0 Support
+                              let primaryScadaTopic = `STATE/${node.primaryScada}`;
+                              node.subscribe(primaryScadaTopic,options,function(topic_,payload_,packet) {
+                                  let status = payload_.toString();
+                                  node.primaryScadaStatus = status;
+                                  for (var id in node.users) {
+                                      if (node.users.hasOwnProperty(id)) {
+                                          let state = node.enableStoreForward && node.primaryScadaStatus === "OFFLINE"  && node.users[id].shouldBuffer === true ? "BUFFERING" : "CONNECTED";
+                                          node.setConnectionState(node.users[id], state);
+                                      }
+                                  }
+                                  node.emptyQueue();
+                              });
+                            }
 
                             // SPb 3.0 Support
                             let primaryScadaTopicv3 = `spBv1.0/STATE/${node.primaryScada}`;
