@@ -16,6 +16,8 @@
 
 const { encodePayload } = require("sparkplug-payload/lib/sparkplugbpayload");
 
+const SUPPORT_SPB_2 = false;
+
 module.exports = function(RED) {
     "use strict";
     var mqtt = require("mqtt");
@@ -178,6 +180,18 @@ module.exports = function(RED) {
             }
         }
 
+        this.getValueType = function(value) {
+            if (typeof value === 'string') {
+                return "String";
+            } else if (typeof value === 'number') {
+                return "Float";
+            } else if (typeof value === 'boolean') {
+                return "Boolean"; 
+            } else {
+                return "Unknown";
+            } 
+        }
+
         this.brokerConn = RED.nodes.getNode(this.broker);
         var node = this;
         if (this.brokerConn) {
@@ -202,111 +216,55 @@ module.exports = function(RED) {
 
                 let validPayload = msg.hasOwnProperty("payload") && typeof msg.payload === 'object' && msg.payload !== null && !Array.isArray(msg.payload);
 
-                if (msg.hasOwnProperty("definition")) {
+                if (!validPayload) return done();
 
-                    // Verify that all metric definitions are correct
-                    let definitionValid = typeof msg.definition === 'object' && msg.definition !== null && !Array.isArray(msg.definition);
-                    if (definitionValid) {
-                        for (const [key, value] of Object.entries(msg.definition)) {
-                            // Check name
-                            if (false) { // TODO: Is there any requirements for the metric name?
-                                this.error(`${key} is not a valid definition !!!`);
-                                definitionValid = false;
-                            }
+                let _metrics = [];
 
-                            if (!value.hasOwnProperty("dataType")) {
-                                this.error(RED._("mqtt-sparkplug-plus.errors.invalid-metric-definition", { name : key, error: `datatype required` }));
-                                definitionValid = false;
-                            }else if (!node.dataTypes.includes(value.dataType)) {
-                                this.error(RED._("mqtt-sparkplug-plus.errors.invalid-metric-definition", { name : key, error: `Invalid datatype ${value.dataType}` }));
-                                definitionValid = false;
-                            }
+                let timestamp = Date.now();
+                if (msg.timestamp){
+                    if (msg.timestamp instanceof Date && !isNaN(m.timestamp)) {
+                        timestamp = msg.timestamp.getTime();
+                    } else {
+                        timestamp = msg.timestamp;
+                    }
+                }
 
-                        }
+                for (const [key, value] of Object.entries(msg.payload)) {
+                    if (!['string', 'number', 'boolean'].includes(typeof value)) continue;
+
+                    const m = {
+                        name: key,
+                        value: value,
+                        type: this.getValueType(value),
+                        timestamp: timestamp
                     }
 
-                    if (definitionValid) {
-                        this.metrics = msg.definition;
+                    // We dont know how long it will take or when REBIRTH will be send
+                    // so always include timewstamp in DBIRTH messages
+                    this.latestMetrics[m.name] = JSON.parse(JSON.stringify(m));
+                    if (!this.latestMetrics[m.name].hasOwnProperty("timestamp")) {
+                        this.latestMetrics[m.name].timestamp = new Date().getTime(); // We dont know when DBIRTH will be send, so force a timetamp in metric
+                    }
+                    _metrics.push(m);
+                }
 
-                        // Filter metrics cache to only include metrics from new definition
-                        var newMetric = {}
-                        for (const [key, value] of Object.entries(this.latestMetrics)) {
-                            if (msg.definition.hasOwnProperty(key)) {
-                                newMetric[key] = value;
-                            }
-                        }
-                        this.latestMetrics = newMetric;
-
-                        if (this.birthMessageSend) {
-
-                            this.sendDDeath();
-
-                            // if there are no payload, then see if we can send a new birth message with the latest
-                            // data, otherwise we'll try to send after the values have been updated
-                            if (!validPayload) {
-                                this.trySendBirth();
-                            }
+                if (msg.topic === '__start' || msg.topic === '__input') {
+                    for (const m of _metrics) {
+                        this.metrics[m.name] = {
+                            dataType: this.getValueType(m.value)
                         }
                     }
                 }
 
-                if (validPayload) {
-
-                    if (msg.payload.hasOwnProperty("metrics") && Array.isArray(msg.payload.metrics)) {
-                        let _metrics = [];
-                        msg.payload.metrics.forEach(m => {
-
-                            if (!m.hasOwnProperty("name")){
-                                this.warn(RED._("mqtt-sparkplug-plus.errors.missing-attribute-name"));
-                            } else if (this.metrics.hasOwnProperty(m.name)) {
-
-                                if (!m.hasOwnProperty("value")) {
-                                    //m.is_null = true;
-                                    m.value = null; // the Sparkplug-payload module will create the isNull property
-                                }
-
-                                // Sparkplug dates are always send a Unix Time
-                                if (m.timestamp instanceof Date && !isNaN(m.timestamp)) {
-                                    m.timestamp = m.timestamp.getTime();
-                                }
-
-                                // Type must be send on every message per the specicications (not sure why)
-                                // We already know then type, so lets append it if it not already there
-                                if (!m.hasOwnProperty("type")) {
-                                    m.type = this.metrics[m.name].dataType;
-                                }
-
-                                // We dont know how long it will take or when REBIRTH will be send
-                                // so always include timewstamp in DBIRTH messages
-                                this.latestMetrics[m.name] = JSON.parse(JSON.stringify(m));
-                                if (!this.latestMetrics[m.name].hasOwnProperty("timestamp")) {
-                                    this.latestMetrics[m.name].timestamp = new Date().getTime(); // We dont know when DBIRTH will be send, so force a timetamp in metric
-                                }
-                                _metrics.push(m);
-                            }else {
-                                node.warn(RED._("mqtt-sparkplug-plus.errors.device-unknown-metric", m));
-                            }
-                        });
-
-                        if (!this.birthMessageSend) {    // Send DBIRTH
-                            this.trySendBirth(done);
-                        }else if (_metrics.length > 0) { // SEND DDATA
-                            let dMsg = this.brokerConn.createMsg(this.name, "DDATA", _metrics, f => {});
-                            if (dMsg) {
-                                this.brokerConn.publish(dMsg, !this.shouldBuffer, done);
-                            }
-                        }
-                    }else
-                    {
-                        node.error(RED._("mqtt-sparkplug-plus.errors.device-no-metrics"));
-                        done();
+                if (!this.birthMessageSend) {    // Send DBIRTH
+                    this.trySendBirth(done);
+                } else if (_metrics.length > 0) { // SEND DDATA
+                    let dMsg = this.brokerConn.createMsg(this.name, "DDATA", _metrics, f => {});
+                    if (dMsg) {
+                        this.brokerConn.publish(dMsg, !this.shouldBuffer, done);
                     }
-                } else {
-                    if (!msg.hasOwnProperty("definition") && !msg.hasOwnProperty("command")) { // Its ok there are no payload if we set the metric definition
-                        node.error(RED._("mqtt-sparkplug-plus.errors.payload-type-object"));
-                    }
-                    done();
                 }
+
             }); // end input
 
             //  Create "NULL" metrics if metrics should be sendt immediately
@@ -780,19 +738,21 @@ module.exports = function(RED) {
                         if (node.enableStoreForward === true) {
                             let options = { qos: 0 };
 
-                            // SPb 2.0 Support
-                            let primaryScadaTopic = `STATE/${node.primaryScada}`;
-                            node.subscribe(primaryScadaTopic,options,function(topic_,payload_,packet) {
-                                let status = payload_.toString();
-                                node.primaryScadaStatus = status;
-                                for (var id in node.users) {
-                                    if (node.users.hasOwnProperty(id)) {
-                                        let state = node.enableStoreForward && node.primaryScadaStatus === "OFFLINE"  && node.users[id].shouldBuffer === true ? "BUFFERING" : "CONNECTED";
-                                        node.setConnectionState(node.users[id], state);
-                                    }
-                                }
-                                node.emptyQueue();
-                            });
+                            if (SUPPORT_SPB_2) {
+                              // SPb 2.0 Support
+                              let primaryScadaTopic = `STATE/${node.primaryScada}`;
+                              node.subscribe(primaryScadaTopic,options,function(topic_,payload_,packet) {
+                                  let status = payload_.toString();
+                                  node.primaryScadaStatus = status;
+                                  for (var id in node.users) {
+                                      if (node.users.hasOwnProperty(id)) {
+                                          let state = node.enableStoreForward && node.primaryScadaStatus === "OFFLINE"  && node.users[id].shouldBuffer === true ? "BUFFERING" : "CONNECTED";
+                                          node.setConnectionState(node.users[id], state);
+                                      }
+                                  }
+                                  node.emptyQueue();
+                              });
+                            }
 
                             // SPb 3.0 Support
                             let primaryScadaTopicv3 = `spBv1.0/STATE/${node.primaryScada}`;
