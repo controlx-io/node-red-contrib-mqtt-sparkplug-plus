@@ -15,6 +15,8 @@
  **/
 
 const { encodePayload } = require("sparkplug-payload/lib/sparkplugbpayload");
+const SQLiteQueueManager = require('./sqlite-queue');
+const fs = require('fs');
 
 module.exports = function(RED) {
     "use strict";
@@ -182,6 +184,7 @@ module.exports = function(RED) {
         var node = this;
         if (this.brokerConn) {
             this.on("input",function(msg,send,done) {
+
                 // Handle Command
                 if (msg.hasOwnProperty("command")) {
                     if (msg.command.hasOwnProperty("device")) {
@@ -377,7 +380,7 @@ module.exports = function(RED) {
         this.bdSeq = 0;
         this.seq = 0;
 
-        this.maxQueueSize = 100000;
+        this.maxQueueSize = 10_000_000;
         // Get information about store forward
         this.enableStoreForward = n.enableStoreForward || false;
         this.devScada = n.devScada || ""
@@ -386,36 +389,106 @@ module.exports = function(RED) {
 
         // This will be set by primary SCADA and written via MQTT (OFFLINE or ONLINE)
         this.primaryScadaStatus = "OFFLINE";
+        
+        // Flag to track when we're processing cached messages
+        this.processingCachedMessages = false;
 
-        // Queue to store events while primary scada offline
-        this.queue = this.context().get("queue");
-        if (!this.queue){
-            this.queue = [];
-            this.context().set("queue", this.queue);
-        }
+        // SQLite database for queue storage
+        this.brokerId = this.id;
+        this.queueManager = new SQLiteQueueManager(this.brokerId);
+        
+        // Initialize database
+        this.queueManager.initializeDatabase().then(() => {
+            // Database initialized successfully
+        }).catch(err => {
+            this.error("Failed to initialize SQLite database: " + err.message);
+        });
+
+        /**
+         * Get the current queue length
+         * @returns {Promise<number>} Promise that resolves to the queue count
+         */
+        this.getQueueLength = async function() {
+            return await node.queueManager.getQueueLength();
+        };
 
         /**
          * empties the current queue
          */
         this.emptyQueue = async function() {
-            if (node.primaryScadaStatus === "ONLINE" && node.connected) {
-                var item = this.queue.shift();
-                let count = 0;
-                while (item && node.primaryScadaStatus === "ONLINE" && node.connected) {
+            if (node.primaryScadaStatus === "ONLINE" && node.connected && node.queueManager) {
+                // Set flag to indicate we're processing cached messages
+                node.processingCachedMessages = true;
+                let totalProcessed = 0;
+                
+                async function processBatch() {
+                    try {
+                        const batchSize = 100;
+                        // Get up to 500 messages from the queue for this broker
+                        const rows = await node.queueManager.getMessagesFromQueue(batchSize);
+                        
+                        if (rows && rows.length > 0 && node.primaryScadaStatus === "ONLINE" && node.connected) {
+                            let processedInBatch = 0;
+                            let messageIds = [];
+                            
+                            // Process all messages in the batch
+                            for (const row of rows) {
+                                try {
+                                    // Parse the stored message
+                                    let item = {
+                                        topic: row.topic,
+                                        payload: JSON.parse(row.payload),
+                                        qos: row.qos,
+                                        retain: row.retain === 1
+                                    };
 
-                    if(!Buffer.isBuffer(item.payload))   {
-                        item.payload = Buffer.from(item.payload.data)
-                    }
+                                    if (!Buffer.isBuffer(item.payload)) {
+                                        item.payload = Buffer.from(item.payload.data);
+                                    }
 
-                    node.publish(item, true);
-                    item = this.queue.shift();
-                    this.context().set("queue", this.queue);
-
-                    // Slow down queue empty
-                    if (++count % 500 === 0) {
-                        await new Promise(resolve => setTimeout(resolve, 250));
+                                    // Publish the message
+                                    node.publish(item, true);
+                                    
+                                    // Collect message IDs for batch deletion
+                                    messageIds.push(row.id);
+                                    processedInBatch++;
+                                    
+                                } catch (parseErr) {
+                                    node.error("Error parsing queued message: " + parseErr.message);
+                                    // Remove the corrupted message immediately
+                                    await node.queueManager.removeMessageFromQueue(row.id);
+                                }
+                            }
+                            
+                            // Batch delete all processed messages
+                            if (messageIds.length > 0) {
+                                await node.queueManager.removeMessagesFromQueue(messageIds);
+                            }
+                            
+                            // If we got a full batch, there might be more messages
+                            if (rows.length === batchSize) {
+                                // Process next batch after a short delay
+                                setTimeout(processBatch, 100);
+                            } else {
+                                // All cached messages processed, clear the flag
+                                node.processingCachedMessages = false;
+                                node.log(`Queue empty. Total messages processed: ${totalProcessed}`);
+                            }
+                            
+                        } else {
+                            // No more messages to process, clear the flag
+                            node.processingCachedMessages = false;
+                            if (totalProcessed > 0) {
+                                node.log(`Queue empty. Total messages processed: ${totalProcessed}`);
+                            }
+                        }
+                    } catch (err) {
+                        node.error("Error reading from queue: " + err.message);
+                        node.processingCachedMessages = false;
                     }
                 }
+                
+                processBatch();
             }
         };
 
@@ -985,53 +1058,96 @@ module.exports = function(RED) {
          * @param {function} done
          * @param {boolean} bypassQueue
          */
-        this.publish = function (msg, bypassQueue, done) {
+        this.publish = async function (msg, bypassQueue, done) {
+            try {
+                // Check if we should publish directly or queue
+                const queueLength = await node.getQueueLength();
 
-            if (node.connected && (!node.enableStoreForward || (node.primaryScadaStatus === "ONLINE" && node.queue.length === 0) || bypassQueue)) {
-                if (msg.payload === null || msg.payload === undefined) {
-                    msg.payload = "";
-                } else if (!Buffer.isBuffer(msg.payload)) {
-                    if (typeof msg.payload === "object") {
-                        msg.payload = JSON.stringify(msg.payload);
-                    } else if (typeof msg.payload !== "string") {
-                        msg.payload = "" + msg.payload;
+                if (node.connected && (!node.enableStoreForward || (node.primaryScadaStatus === "ONLINE" && (queueLength === 0 || node.processingCachedMessages)) || bypassQueue)) {
+                    if (msg.payload === null || msg.payload === undefined) {
+                        msg.payload = "";
+                    } else if (!Buffer.isBuffer(msg.payload)) {
+                        if (typeof msg.payload === "object") {
+                            msg.payload = JSON.stringify(msg.payload);
+                        } else if (typeof msg.payload !== "string") {
+                            msg.payload = "" + msg.payload;
+                        }
+                    }
+                    var options = {
+                        qos: msg.qos || 0,
+                        retain: msg.retain || false
+                    };
+
+                    node.client.publish(msg.topic, msg.payload, options, function(err) {
+                        if (err) console.error("Error publishing message", err);
+                        done && done(err);
+                        return;
+                    });
+                } else {
+                    // Queue the message
+                    if (queueLength >= node.maxQueueSize) {
+                        // Remove oldest message if queue is full for this broker
+                        await node.queueManager.removeOldestMessage();
+                    } else if (queueLength === node.maxQueueSize - 1) {
+                        node.warn(RED._("mqtt-sparkplug-plus.errors.buffer-full"));
+                    }
+
+                    // Store message in SQLite
+                    if (node.queueManager) {
+                        await node.queueManager.addMessageToQueue(
+                            msg.topic, 
+                            msg.payload, 
+                            msg.qos || 0, 
+                            msg.retain || false
+                        );
+                        done && done();
+                    } else {
+                        node.error("Database not initialized, message lost");
+                        done && done();
                     }
                 }
-                var options = {
-                    qos: msg.qos || 0,
-                    retain: msg.retain || false
-                };
-
-                node.client.publish(msg.topic, msg.payload, options, function(err) {
-                    done && done(err);
-                    return;
-                });
-            } else {
-                if (node.queue.length === node.maxQueueSize) {
-                    node.queue.shift();
-                    node.context().set("queue", node.queue);
-                    //console.log("Queue Size", node.queue.length);
-                }else if (node.queue.length  === node.maxQueueSize-1) {
-                    node.warn(RED._("mqtt-sparkplug-plus.errors.buffer-full"));
-                }
-                node.queue.push(msg);
-                node.context().set("queue", node.queue);
+            } catch (err) {
+                node.error("Error in publish: " + err.message);
                 done && done();
             }
         };
 
-        this.on('close', function(done) {
+        this.on('close', async function(done) {
             this.closing = true;
-            if (this.connected) {
-                this.client.once('close', function() {
+            
+            // Close SQLite database
+            if (this.queueManager) {
+                try {
+                    await this.queueManager.closeDatabase();
+                } catch (err) {
+                    this.error("Error closing database: " + err.message);
+                }
+                
+                // Close MQTT connection
+                if (this.connected) {
+                    this.client.once('close', function() {
+                        done();
+                    });
+                    this.client.end();
+                } else if (this.connecting || node.client.reconnecting) {
+                    node.client.end();
                     done();
-                });
-                this.client.end();
-            } else if (this.connecting || node.client.reconnecting) {
-                node.client.end();
-                done();
+                } else {
+                    done();
+                }
             } else {
-                done();
+                // Close MQTT connection if no database
+                if (this.connected) {
+                    this.client.once('close', function() {
+                        done();
+                    });
+                    this.client.end();
+                } else if (this.connecting || node.client.reconnecting) {
+                    node.client.end();
+                    done();
+                } else {
+                    done();
+                }
             }
         });
     }
