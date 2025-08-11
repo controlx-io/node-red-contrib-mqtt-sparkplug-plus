@@ -447,7 +447,7 @@ module.exports = function(RED) {
                                     }
 
                                     // Publish the message
-                                    node.publish(item, true);
+                                    await node.publish(item, true);
                                     
                                     // Collect message IDs for batch deletion
                                     messageIds.push(row.id);
@@ -1078,10 +1078,16 @@ module.exports = function(RED) {
                         retain: msg.retain || false
                     };
 
-                    node.client.publish(msg.topic, msg.payload, options, function(err) {
-                        if (err) console.error("Error publishing message", err);
-                        done && done(err);
-                        return;
+                    // Make the MQTT publish call properly async
+                    await new Promise((resolve, reject) => {
+                        node.client.publish(msg.topic, msg.payload, options, function(err) {
+                            if (err) {
+                                console.error("Error publishing message", err);
+                                reject(err);
+                            } else {
+                                resolve();
+                            }
+                        });
                     });
                 } else {
                     // Queue the message
