@@ -142,9 +142,8 @@ module.exports = function(RED) {
         }
         /**
          * try to send Sparkplug DBirth Messages
-         * @param {function} done Node-Red Done Function
          */
-        this.trySendBirth = function(done) {
+        this.trySendBirth = async function() {
             let readyToSend = Object.keys(this.metrics).every(m => this.latestMetrics.hasOwnProperty(m));
 
             // Don't send birth if no metrics. we can assume that a dynamic defintion will be send if on metrics are defined.
@@ -162,7 +161,7 @@ module.exports = function(RED) {
                 }
                 let bMsg = node.brokerConn.createMsg(this.name, "DBIRTH", birthMetrics, f => {});
                 if(bMsg) {
-                    this.brokerConn.publish(bMsg, !this.shouldBuffer, done);  // send the message
+                    await this.brokerConn.publish(bMsg, !this.shouldBuffer);  // send the message
                     this.birthMessageSend = true;
                 }
             }
@@ -170,12 +169,11 @@ module.exports = function(RED) {
 
         /**
          * Send DDeath message
-         * @param {function} done Node-Red Done Function
          */
-        this.sendDDeath = function(done) {
+        this.sendDDeath = async function() {
             let dMsg = node.brokerConn.createMsg(this.name, "DDEATH", [], x=>{});
             if(dMsg) {
-                this.brokerConn.publish(dMsg, !this.shouldBuffer, done);  // send the message
+                await this.brokerConn.publish(dMsg, !this.shouldBuffer);  // send the message
                 this.birthMessageSend = false;
             }
         }
@@ -183,20 +181,20 @@ module.exports = function(RED) {
         this.brokerConn = RED.nodes.getNode(this.broker);
         var node = this;
         if (this.brokerConn) {
-            this.on("input",function(msg,send,done) {
+            this.on("input",async function(msg,send,done) {
 
                 // Handle Command
                 if (msg.hasOwnProperty("command")) {
                     if (msg.command.hasOwnProperty("device")) {
                         if (msg.command.device.rebirth) {
                             if (this.birthMessageSend) {
-                                this.sendDDeath();
+                                await this.sendDDeath();
                             }
-                            this.trySendBirth();
+                            await this.trySendBirth();
                         }
                         if (msg.command.device.death) {
                             if (this.birthMessageSend) {
-                                this.sendDDeath();
+                                await this.sendDDeath();
                             }
                         }
 
@@ -242,12 +240,12 @@ module.exports = function(RED) {
 
                         if (this.birthMessageSend) {
 
-                            this.sendDDeath();
+                            await this.sendDDeath();
 
                             // if there are no payload, then see if we can send a new birth message with the latest
                             // data, otherwise we'll try to send after the values have been updated
                             if (!validPayload) {
-                                this.trySendBirth();
+                                await this.trySendBirth();
                             }
                         }
                     }
@@ -292,11 +290,13 @@ module.exports = function(RED) {
                         });
 
                         if (!this.birthMessageSend) {    // Send DBIRTH
-                            this.trySendBirth(done);
+                            await this.trySendBirth();
+                            done && done();
                         }else if (_metrics.length > 0) { // SEND DDATA
                             let dMsg = this.brokerConn.createMsg(this.name, "DDATA", _metrics, f => {});
                             if (dMsg) {
-                                this.brokerConn.publish(dMsg, !this.shouldBuffer, done);
+                                await this.brokerConn.publish(dMsg, !this.shouldBuffer);
+                                done && done();
                             }
                         }
                     }else
@@ -389,9 +389,6 @@ module.exports = function(RED) {
 
         // This will be set by primary SCADA and written via MQTT (OFFLINE or ONLINE)
         this.primaryScadaStatus = "OFFLINE";
-        
-        // Flag to track when we're processing cached messages
-        this.processingCachedMessages = false;
 
         // SQLite database for queue storage
         this.brokerId = this.id;
@@ -417,18 +414,14 @@ module.exports = function(RED) {
          */
         this.emptyQueue = async function() {
             if (node.primaryScadaStatus === "ONLINE" && node.connected && node.queueManager) {
-                // Set flag to indicate we're processing cached messages
-                node.processingCachedMessages = true;
                 let totalProcessed = 0;
                 
                 async function processBatch() {
                     try {
                         const batchSize = 100;
-                        // Get up to 500 messages from the queue for this broker
                         const rows = await node.queueManager.getMessagesFromQueue(batchSize);
                         
                         if (rows && rows.length > 0 && node.primaryScadaStatus === "ONLINE" && node.connected) {
-                            let processedInBatch = 0;
                             let messageIds = [];
                             
                             // Process all messages in the batch
@@ -446,12 +439,12 @@ module.exports = function(RED) {
                                         item.payload = Buffer.from(item.payload.data);
                                     }
 
-                                    // Publish the message
+                                    // Publish the message (will be sent immediately since we're online)
                                     await node.publish(item, true);
                                     
                                     // Collect message IDs for batch deletion
                                     messageIds.push(row.id);
-                                    processedInBatch++;
+                                    totalProcessed++;
                                     
                                 } catch (parseErr) {
                                     node.error("Error parsing queued message: " + parseErr.message);
@@ -470,21 +463,16 @@ module.exports = function(RED) {
                                 // Process next batch after a short delay
                                 setTimeout(processBatch, 100);
                             } else {
-                                // All cached messages processed, clear the flag
-                                node.processingCachedMessages = false;
                                 node.log(`Queue empty. Total messages processed: ${totalProcessed}`);
                             }
                             
                         } else {
-                            // No more messages to process, clear the flag
-                            node.processingCachedMessages = false;
                             if (totalProcessed > 0) {
                                 node.log(`Queue empty. Total messages processed: ${totalProcessed}`);
                             }
                         }
                     } catch (err) {
                         node.error("Error reading from queue: " + err.message);
-                        node.processingCachedMessages = false;
                     }
                 }
                 
@@ -610,7 +598,7 @@ module.exports = function(RED) {
         /**
          * Send NBirth Message
          */
-        this.sendBirth = function() {
+        this.sendBirth = async function() {
             this.seq = 0;
             var birthMessageMetrics = [
 
@@ -626,11 +614,11 @@ module.exports = function(RED) {
                 }];
             var nbirth = node.createMsg("", "NBIRTH", birthMessageMetrics, x=>{});
             if (nbirth) {
-                node.publish(nbirth);
+                await node.publish(nbirth);
                 for (var id in node.users) {
                     if (node.users.hasOwnProperty(id) && node.users[id].trySendBirth) {
                         node.users[id].birthMessageSend = false;
-                        node.users[id].trySendBirth(x=>{});
+                        await node.users[id].trySendBirth();
                     }
                 }
             }
@@ -773,7 +761,7 @@ module.exports = function(RED) {
          * @param {function} done
          * @returns void
          */
-        this.deregister = function(mqttNode,done) {
+        this.deregister = async function(mqttNode,done) {
             delete node.users[mqttNode.id];
             if (node.closing) {
                 return done();
@@ -782,10 +770,8 @@ module.exports = function(RED) {
                 if (node.client && node.client.connected) {
                     // Send close message
                     let msg = this.getDeathPayload();
-                    node.publish(msg, false, function(err) {
-                        //node.client.end(done);
-                        node.client.end(true, {}, done);
-                    });
+                    await node.publish(msg, false);
+                    node.client.end(true, {}, done);
                     return;
                 } else {
                     node.client.end();
@@ -947,7 +933,7 @@ module.exports = function(RED) {
 
                                 let bMsg = this.getDeathPayload();
                                 if(bMsg) {
-                                    node.publish(bMsg, !this.shouldBuffer, f => {});  // send the message
+                                    node.publish(bMsg, !this.shouldBuffer);  // send the message
                                 }
 
                                 node.sendBirth();
@@ -1058,12 +1044,13 @@ module.exports = function(RED) {
          * @param {function} done
          * @param {boolean} bypassQueue
          */
-        this.publish = async function (msg, bypassQueue, done) {
+        this.publish = async function (msg, bypassQueue) {
             try {
                 // Check if we should publish directly or queue
                 const queueLength = await node.getQueueLength();
 
-                if (node.connected && (!node.enableStoreForward || (node.primaryScadaStatus === "ONLINE" && (queueLength === 0 || node.processingCachedMessages)) || bypassQueue)) {
+                // we remove queueLength === 0 check because we want to publish real-time messages when primary scada is online
+                if (node.connected && (!node.enableStoreForward || (node.primaryScadaStatus === "ONLINE") || bypassQueue)) {
                     if (msg.payload === null || msg.payload === undefined) {
                         msg.payload = "";
                     } else if (!Buffer.isBuffer(msg.payload)) {
@@ -1106,15 +1093,12 @@ module.exports = function(RED) {
                             msg.qos || 0, 
                             msg.retain || false
                         );
-                        done && done();
                     } else {
                         node.error("Database not initialized, message lost");
-                        done && done();
                     }
                 }
             } catch (err) {
                 node.error("Error in publish: " + err.message);
-                done && done();
             }
         };
 
@@ -1234,7 +1218,7 @@ module.exports = function(RED) {
         var node = this;
 
         if (this.brokerConn) {
-            this.on("input",function(msg,send,done) {
+            this.on("input",async function(msg,send,done) {
 
                 // abort if not connected and node is not configured to buffer
                 if (!node.brokerConn.connected && this.shouldBuffer !== true) {
@@ -1268,7 +1252,8 @@ module.exports = function(RED) {
 
                         try {
                             msg.payload =  sparkplugEncode(msg.payload);
-                            this.brokerConn.publish(msg, !this.shouldBuffer, done);  // send the message
+                            await this.brokerConn.publish(msg, !this.shouldBuffer);  // send the message
+                            done();
                         } catch (e) {
                             done(e);
                         }
