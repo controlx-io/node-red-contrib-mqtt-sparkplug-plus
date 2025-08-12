@@ -393,6 +393,7 @@ module.exports = function(RED) {
         // SQLite database for queue storage
         this.brokerId = this.id;
         this.queueManager = new SQLiteQueueManager(this.brokerId);
+        this.lastTimeStatusUpdated = Date.now();
         
         // Initialize database
         this.queueManager.initializeDatabase().then(() => {
@@ -462,8 +463,18 @@ module.exports = function(RED) {
                             if (rows.length === batchSize) {
                                 // Process next batch after a short delay
                                 setTimeout(processBatch, 100);
+                                for (var id in node.users) {
+                                  if (node.users.hasOwnProperty(id)) {
+                                      node.setConnectionState(node.users[id], "CONNECTED");
+                                  }
+                                }
                             } else {
                                 node.log(`Queue empty. Total messages processed: ${totalProcessed}`);
+                                for (var id in node.users) {
+                                  if (node.users.hasOwnProperty(id)) {
+                                      node.setConnectionState(node.users[id], "CONNECTED");
+                                  }
+                                }
                             }
                             
                         } else {
@@ -480,20 +491,21 @@ module.exports = function(RED) {
             }
         };
 
-        this.setConnectionState = function(node, state) {
+        this.setConnectionState = async function(node, state) {
+            const queueLength = await this.getQueueLength();
 
             switch(state) {
                 case "CONNECTED":
-                    node.status({fill:"green",shape:"dot",text:"node-red:common.status.connected"});
+                    node.status({fill:"green",shape:"dot",text:"Connected" + (queueLength > 0 ? ` (${queueLength} cached)` : "")});
                     break;
                 case "DISCONNECTED":
-                    node.status({fill:"red",shape:"ring",text:"node-red:common.status.disconnected"});
+                    node.status({fill:"red",shape:"ring",text:"Disconnected"});
                     break;
                 case "RECONNECTING":
-                    node.status({fill:"yellow",shape:"ring",text:"node-red:common.status.connecting"});
+                    node.status({fill:"yellow",shape:"ring",text:"Connecting"});
                     break;
                 case "BUFFERING": // Online´
-                    node.status({fill:"blue",shape:"dot",text:"destination offline"});
+                    node.status({fill:"blue",shape:"dot",text:"destination offline" + (queueLength > 0 ? ` (${queueLength} cached)` : "")});
                     break;
                 default:
                     node.status({fill:"gray",shape:"dot",text:state}); // Unknown State
@@ -1087,6 +1099,15 @@ module.exports = function(RED) {
 
                     // Store message in SQLite
                     if (node.queueManager) {
+                        // update status every second to show 
+                        if (Date.now() - node.lastTimeStatusUpdated > 1000) {
+                            for (var id in node.users) {
+                                if (node.users.hasOwnProperty(id)) {
+                                    node.setConnectionState(node.users[id], "BUFFERING");
+                                }
+                                node.lastTimeStatusUpdated = Date.now();
+                            }
+                        }
                         await node.queueManager.addMessageToQueue(
                             msg.topic, 
                             msg.payload, 
