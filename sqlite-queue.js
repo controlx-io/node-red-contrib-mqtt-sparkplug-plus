@@ -12,6 +12,7 @@ class SQLiteQueueManager {
         this.brokerId = brokerId;
         this.db = null;
         this.dbInitialized = false;
+        this.queueLength = -1;
     }
 
     /**
@@ -64,16 +65,21 @@ class SQLiteQueueManager {
         if (!this.db) {
             return 0;
         }
-        
-        return new Promise((resolve, reject) => {
-            this.db.get("SELECT COUNT(*) as count FROM message_queue", (err, row) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(row.count);
-                }
-            });
-        });
+
+        if (this.queueLength === -1) {
+          return new Promise((resolve, reject) => {
+              this.db.get("SELECT COUNT(*) as count FROM message_queue", (err, row) => {
+                  if (err) {
+                      reject(err);
+                  } else {
+                      this.queueLength = row.count;
+                      resolve(row.count);
+                  }
+              });
+          });
+        } else {
+          return this.queueLength;
+        }
     }
 
     /**
@@ -88,6 +94,7 @@ class SQLiteQueueManager {
         if (!this.db) {
             throw new Error("Database not initialized");
         }
+        this.queueLength += 1;
 
         let payloadStr = JSON.stringify(payload);
         return new Promise((resolve, reject) => {
@@ -110,6 +117,8 @@ class SQLiteQueueManager {
         if (!this.db) {
             throw new Error("Database not initialized");
         }
+
+        this.queueLength -= 1;
 
         return new Promise((resolve, reject) => {
             this.db.run("DELETE FROM message_queue WHERE id = (SELECT MIN(id) FROM message_queue)", (err) => {
@@ -150,6 +159,8 @@ class SQLiteQueueManager {
             return;
         }
 
+        this.queueLength -= messageIds.length;
+
         const placeholders = messageIds.map(() => '?').join(',');
         return new Promise((resolve, reject) => {
             this.db.run(`DELETE FROM message_queue WHERE id IN (${placeholders})`, messageIds, (err) => {
@@ -168,6 +179,8 @@ class SQLiteQueueManager {
         if (!this.db) {
             throw new Error("Database not initialized");
         }
+
+        this.queueLength -= 1;
 
         return new Promise((resolve, reject) => {
             this.db.run("DELETE FROM message_queue WHERE id = ?", [messageId], (err) => {
