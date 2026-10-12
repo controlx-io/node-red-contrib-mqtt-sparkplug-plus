@@ -395,12 +395,41 @@ module.exports = function(RED) {
         this.queueManager = new SQLiteQueueManager(this.brokerId);
         this.lastTimeStatusUpdated = Date.now();
         
+        // Messages dropped while disconnected because store forward is off (logged on reconnect)
+        this.droppedWhileDisconnected = 0;
+
         // Initialize database
-        this.queueManager.initializeDatabase().then(() => {
-            // Database initialized successfully
+        this.queueManager.initializeDatabase().then(async () => {
+            if (!this.enableStoreForward) {
+                await this.discardStaleQueues();
+            }
         }).catch(err => {
             this.error("Failed to initialize SQLite database: " + err.message);
         });
+
+        /**
+         * Without store forward nothing ever drains the queue (emptyQueue waits for the primary
+         * SCADA, whose state is only tracked when store forward is on). Remove what earlier
+         * versions buffered: the SQLite queue and the queue that versions before 1.4.2 kept in
+         * the node context, which Node-RED rewrites to disk on every change and which could
+         * grow to 100,000 messages (over 100 MB) and block the runtime while being saved.
+         */
+        this.discardStaleQueues = async function() {
+            try {
+                const legacyQueue = node.context().get("queue");
+                if (legacyQueue !== undefined) {
+                    node.context().set("queue", undefined);
+                    node.log(`Store forward is off: removed ${Array.isArray(legacyQueue) ? legacyQueue.length : 0} queued message(s) from the node context`);
+                }
+                const queued = await node.queueManager.getQueueLength();
+                if (queued > 0) {
+                    await node.queueManager.clearQueue();
+                    node.log(`Store forward is off: removed ${queued} queued message(s) from the SQLite queue`);
+                }
+            } catch (err) {
+                node.error("Error removing stale queue: " + err.message);
+            }
+        };
 
         /**
          * Get the current queue length
@@ -810,6 +839,10 @@ module.exports = function(RED) {
                         node.connected = true;
                         node.log(RED._("mqtt-sparkplug-plus.state.connected",{broker:(node.clientid?node.clientid+"@":"")+node.brokerurl}));
                         node.log(node.prdMode ? "Production Mode" : "Development Mode")
+                        if (node.droppedWhileDisconnected > 0) {
+                            node.log(`Store forward is off: dropped ${node.droppedWhileDisconnected} message(s) while disconnected`);
+                            node.droppedWhileDisconnected = 0;
+                        }
                         for (var id in node.users) {
                             if (node.users.hasOwnProperty(id)) {
                                 let state = node.enableStoreForward && node.primaryScadaStatus === "OFFLINE"  && node.users[id].shouldBuffer === true ? "BUFFERING" : "CONNECTED";
@@ -1058,6 +1091,14 @@ module.exports = function(RED) {
          */
         this.publish = async function (msg, bypassQueue) {
             try {
+                // Without store forward a queued message would never be sent (see discardStaleQueues),
+                // so drop it. On reconnect the node and its devices send new BIRTH messages with
+                // their current values.
+                if (!node.enableStoreForward && !node.connected) {
+                    node.droppedWhileDisconnected++;
+                    return;
+                }
+
                 // Check if we should publish directly or queue
                 const queueLength = await node.getQueueLength();
 

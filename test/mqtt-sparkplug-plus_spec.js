@@ -2069,3 +2069,83 @@ describe('mqtt sparkplug out node', function () {
 		});
 
 });
+
+describe('mqtt sparkplug broker queue without store forward', function () {
+	// Port 1 is closed, so the broker node stays disconnected.
+	const flow = (enableStoreForward) => [
+		{
+			"id": "b1",
+			"type": "mqtt-sparkplug-broker",
+			"name": "Offline",
+			"deviceGroup": "My Devices",
+			"eonName": "Node-Red",
+			"broker": "localhost",
+			"port": "1",
+			"clientid": "",
+			"usetls": false,
+			"protocolVersion": "4",
+			"keepalive": "60",
+			"cleansession": true,
+			"enableStoreForward": enableStoreForward,
+			"primaryScada": "MY SCADA"
+		}
+	];
+
+	const msg = () => ({ topic: "spBv1.0/My Devices/DDATA/Node-Red/dev", payload: Buffer.from([8, 1, 2, 3]) });
+
+	function loadBroker(enableStoreForward, cb) {
+		helper.load(sparkplugNode, flow(enableStoreForward), function () {
+			const b1 = helper.getNode("b1");
+			const wait = () => b1.queueManager.dbInitialized ? setTimeout(() => cb(b1), 50) : setTimeout(wait, 20);
+			wait();
+		});
+	}
+
+	it('should not queue messages while disconnected when store forward is off', function (done) {
+		loadBroker(false, async function (b1) {
+			try {
+				b1.connected.should.be.false();
+				for (let i = 0; i < 5; i++) {
+					await b1.publish(msg(), false);
+				}
+				(await b1.getQueueLength()).should.eql(0);
+				b1.droppedWhileDisconnected.should.eql(5);
+				done();
+			} catch (e) {
+				done(e);
+			}
+		});
+	});
+
+	it('should still queue messages while disconnected when store forward is on', function (done) {
+		loadBroker(true, async function (b1) {
+			try {
+				await b1.queueManager.clearQueue();
+				await b1.publish(msg(), false);
+				await b1.publish(msg(), false);
+				(await b1.getQueueLength()).should.eql(2);
+				b1.droppedWhileDisconnected.should.eql(0);
+				await b1.queueManager.clearQueue();
+				done();
+			} catch (e) {
+				done(e);
+			}
+		});
+	});
+
+	it('should remove stale SQLite and context queues when store forward is off', function (done) {
+		loadBroker(false, async function (b1) {
+			try {
+				await b1.queueManager.addMessageToQueue("t/1", Buffer.from([1]), 0, false);
+				await b1.queueManager.addMessageToQueue("t/2", Buffer.from([2]), 0, false);
+				b1.context().set("queue", [msg(), msg(), msg()]);
+				await b1.discardStaleQueues();
+				(await b1.getQueueLength()).should.eql(0);
+				should(b1.context().get("queue")).be.undefined();
+				done();
+			} catch (e) {
+				done(e);
+			}
+		});
+	});
+});

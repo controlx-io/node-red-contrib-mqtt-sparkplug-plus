@@ -23,7 +23,33 @@ class SQLiteQueueManager {
         if (this.dbInitialized && this.db) {
             return this.db;
         }
+        if (!this.initPromise) {
+            this.initPromise = this.openDatabase();
+        }
+        return this.initPromise;
+    }
 
+    /**
+     * Wait until the queue table exists. Queries sent before that fail with
+     * "no such table: message_queue" on a new database.
+     * @returns {Promise<boolean>} true when the database is ready
+     */
+    async ready() {
+        if (this.dbInitialized) {
+            return true;
+        }
+        if (!this.initPromise) {
+            return false;
+        }
+        try {
+            await this.initPromise;
+        } catch (err) {
+            return false;
+        }
+        return this.dbInitialized;
+    }
+
+    async openDatabase() {
         // Create data directory if it doesn't exist
         var dataDir = path.join(process.cwd(), 'data');
         if (!fs.existsSync(dataDir)) {
@@ -62,7 +88,7 @@ class SQLiteQueueManager {
      * @returns {Promise<number>} Promise that resolves to the queue count
      */
     async getQueueLength() {
-        if (!this.db) {
+        if (!this.db || !(await this.ready())) {
             return 0;
         }
 
@@ -91,7 +117,7 @@ class SQLiteQueueManager {
      * @returns {Promise<void>}
      */
     async addMessageToQueue(topic, payload, qos = 0, retain = false) {
-        if (!this.db) {
+        if (!this.db || !(await this.ready())) {
             throw new Error("Database not initialized");
         }
         this.queueLength += 1;
@@ -191,6 +217,26 @@ class SQLiteQueueManager {
     }
 
     /**
+     * Remove all messages from the queue
+     * @returns {Promise<void>}
+     */
+    async clearQueue() {
+        if (!this.db) {
+            throw new Error("Database not initialized");
+        }
+
+        return new Promise((resolve, reject) => {
+            this.db.run("DELETE FROM message_queue", (err) => {
+                if (err) reject(err);
+                else {
+                    this.queueLength = 0;
+                    resolve();
+                }
+            });
+        });
+    }
+
+    /**
      * Close the database connection
      * @returns {Promise<void>}
      */
@@ -205,6 +251,7 @@ class SQLiteQueueManager {
                 else {
                     this.db = null;
                     this.dbInitialized = false;
+                    this.initPromise = null;
                     resolve();
                 }
             });

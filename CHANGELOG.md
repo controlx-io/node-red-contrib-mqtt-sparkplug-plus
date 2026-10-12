@@ -1,3 +1,17 @@
+### 1.4.2: Maintenance Release
+
+ Fixed:
+- With store forward off, messages published while disconnected are no longer queued. Nothing
+  ever sent that queue (it waits for the primary SCADA, which is only tracked with store
+  forward on), so it only grew. The node and devices send BIRTH messages with current values on
+  reconnect; the number of dropped messages is logged.
+- With store forward off, queues left by earlier versions are removed on start: the SQLite
+  queue, and the queue kept in the node context by versions before the SQLite queue. Node-RED
+  rewrote that context queue to disk on every change; at up to 100,000 messages (over 100 MB)
+  each save blocked the runtime for seconds.
+- Fixed a crash on first start (new queue database): the queue was queried before its table
+  was created ("SQLITE_ERROR: no such table: message_queue", unhandled rejection).
+
 ### 1.4.1: Maintenance Release
 
  Fixed:
